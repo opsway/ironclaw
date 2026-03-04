@@ -167,6 +167,11 @@ pub struct HttpCapabilitySchema {
     /// Request timeout in seconds.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+
+    /// Allow plain HTTP (insecure) requests.
+    /// Only for internal/local use — do not set in production.
+    #[serde(default)]
+    pub allow_http: bool,
 }
 
 impl HttpCapabilitySchema {
@@ -198,6 +203,9 @@ impl HttpCapabilitySchema {
         }
         if let Some(secs) = self.timeout_secs {
             cap.timeout = Duration::from_secs(secs);
+        }
+        if self.allow_http {
+            cap.allow_http = true;
         }
 
         cap

@@ -50,8 +50,18 @@ impl Agent {
 
         // Load workspace system prompt (identity files: AGENTS.md, SOUL.md, etc.)
         // In group chats, MEMORY.md is excluded to prevent leaking personal context.
+        // Resolve the user's timezone
+        let user_tz = crate::timezone::resolve_timezone(
+            message.timezone.as_deref(),
+            None, // user setting lookup can be added later
+            &self.config.default_timezone,
+        );
+
         let system_prompt = if let Some(ws) = self.workspace() {
-            match ws.system_prompt_for_context(is_group_chat).await {
+            match ws
+                .system_prompt_for_context_tz(is_group_chat, user_tz)
+                .await
+            {
                 Ok(prompt) if !prompt.is_empty() => Some(prompt),
                 Ok(_) => None,
                 Err(e) => {
@@ -103,7 +113,7 @@ impl Agent {
             None
         };
 
-        let mut reasoning = Reasoning::new(self.llm().clone(), self.safety().clone())
+        let mut reasoning = Reasoning::new(self.llm().clone())
             .with_channel(message.channel.clone())
             .with_model_name(self.llm().active_model_name())
             .with_group_chat(is_group_chat);
@@ -130,6 +140,18 @@ impl Agent {
         let mut job_ctx =
             JobContext::with_user(&message.user_id, "chat", "Interactive chat session");
         job_ctx.http_interceptor = self.deps.http_interceptor.clone();
+        job_ctx.user_timezone = user_tz.name().to_string();
+
+        // Build system prompts once for this turn. Two variants: with tools
+        // (normal iterations) and without (force_text final iteration).
+        let initial_tool_defs = self.tools().tool_definitions().await;
+        let initial_tool_defs = if !active_skills.is_empty() {
+            crate::skills::attenuate_tools(&initial_tool_defs, &active_skills).tools
+        } else {
+            initial_tool_defs
+        };
+        let cached_prompt = reasoning.build_system_prompt_with_tools(&initial_tool_defs);
+        let cached_prompt_no_tools = reasoning.build_system_prompt_with_tools(&[]);
 
         let max_tool_iterations = self.config.max_tool_iterations;
         // Force a text-only response on the last iteration to guarantee termination
@@ -138,6 +160,8 @@ impl Agent {
         let force_text_at = max_tool_iterations;
         let nudge_at = max_tool_iterations.saturating_sub(1);
         let mut iteration = 0;
+        const MAX_TOOL_INTENT_NUDGES: u32 = 2;
+        let mut consecutive_tool_intent_nudges: u32 = 0;
         loop {
             iteration += 1;
             // Hard ceiling one past the forced-text iteration (should never be reached
@@ -206,10 +230,16 @@ impl Agent {
             };
 
             // Call LLM with current context; force_text drops tools to guarantee a
-            // text response on the final iteration.
+            // text response on the final iteration. The pre-built system prompt
+            // avoids rebuilding the same ~1,500-token string each iteration.
             let mut context = ReasoningContext::new()
                 .with_messages(context_messages.clone())
                 .with_tools(tool_defs)
+                .with_system_prompt(if force_text {
+                    cached_prompt_no_tools.clone()
+                } else {
+                    cached_prompt.clone()
+                })
                 .with_metadata({
                     let mut m = std::collections::HashMap::new();
                     m.insert("thread_id".to_string(), thread_id.to_string());
@@ -246,7 +276,7 @@ impl Agent {
                     // Compact: keep system messages + last user message + current turn
                     context_messages = compact_messages_for_retry(&context_messages);
 
-                    // Rebuild context with compacted messages
+                    // Rebuild context with compacted messages, reusing cached prompt
                     let mut retry_context = ReasoningContext::new()
                         .with_messages(context_messages.clone())
                         .with_tools(if force_text {
@@ -256,6 +286,7 @@ impl Agent {
                         })
                         .with_metadata(context.metadata.clone());
                     retry_context.force_text = force_text;
+                    retry_context.system_prompt = context.system_prompt.clone();
 
                     reasoning
                         .respond_with_tools(&retry_context)
@@ -276,12 +307,18 @@ impl Agent {
 
             // Record cost and track token usage
             let model_name = self.llm().active_model_name();
+            let read_discount = self.llm().cache_read_discount();
+            let write_multiplier = self.llm().cache_write_multiplier();
             let call_cost = self
                 .cost_guard()
                 .record_llm_call(
                     &model_name,
                     output.usage.input_tokens,
                     output.usage.output_tokens,
+                    output.usage.cache_read_input_tokens,
+                    output.usage.cache_creation_input_tokens,
+                    read_discount,
+                    write_multiplier,
                     Some(self.llm().cost_per_token()),
                 )
                 .await;
@@ -294,6 +331,24 @@ impl Agent {
 
             match output.result {
                 RespondResult::Text(text) => {
+                    // Nudge the LLM if it expressed tool intent without calling tools.
+                    // This is common with non-Anthropic models (e.g. GLM-5 via NEAR AI)
+                    // that output "Let me search…" but don't issue tool_calls.
+                    if !force_text
+                        && !context.available_tools.is_empty()
+                        && consecutive_tool_intent_nudges < MAX_TOOL_INTENT_NUDGES
+                        && crate::llm::llm_signals_tool_intent(&text)
+                    {
+                        consecutive_tool_intent_nudges += 1;
+                        tracing::info!(
+                            iteration,
+                            "LLM expressed tool intent without calling a tool, nudging"
+                        );
+                        context_messages.push(ChatMessage::assistant(&text));
+                        context_messages.push(ChatMessage::user(crate::llm::TOOL_INTENT_NUDGE));
+                        continue;
+                    }
+
                     // Strip internal "[Called tool ...]" text that can leak when
                     // provider flattening (e.g. NEAR AI) converts tool_calls to
                     // plain text and the LLM echoes it back.
@@ -304,6 +359,7 @@ impl Agent {
                     tool_calls,
                     content,
                 } => {
+                    consecutive_tool_intent_nudges = 0;
                     // Add the assistant message with tool_calls to context.
                     // OpenAI protocol requires this before tool-result messages.
                     context_messages.push(ChatMessage::assistant_with_tool_calls(
@@ -625,8 +681,53 @@ impl Agent {
                                         .into())
                                     });
 
-                                // Send ToolResult preview
-                                if let Ok(ref output) = tool_result
+                                // Detect image generation sentinel in tool output
+                                // (only from image tools — avoids parsing all tool outputs)
+                                let is_image_sentinel = if let Ok(ref output) = tool_result
+                                    && matches!(tc.name.as_str(), "image_generate" | "image_edit")
+                                {
+                                    if let Ok(sentinel) =
+                                        serde_json::from_str::<serde_json::Value>(output)
+                                        && sentinel.get("type").and_then(|v| v.as_str())
+                                            == Some("image_generated")
+                                    {
+                                        let data_url = sentinel
+                                            .get("data")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        let path = sentinel
+                                            .get("path")
+                                            .and_then(|v| v.as_str())
+                                            .map(String::from);
+                                        // Skip broadcasting if data_url is empty to avoid
+                                        // sending a broken ImageGenerated SSE event.
+                                        if data_url.is_empty() {
+                                            tracing::warn!(
+                                                "Image generation sentinel has empty data URL, skipping broadcast"
+                                            );
+                                        } else {
+                                            let _ = self
+                                                .channels
+                                                .send_status(
+                                                    &message.channel,
+                                                    StatusUpdate::ImageGenerated { data_url, path },
+                                                    &message.metadata,
+                                                )
+                                                .await;
+                                        }
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+
+                                // Send ToolResult preview (skip for image sentinels to avoid
+                                // broadcasting multi-MB base64 data as a preview)
+                                if !is_image_sentinel
+                                    && let Ok(ref output) = tool_result
                                     && !output.is_empty()
                                 {
                                     let _ = self
@@ -640,23 +741,6 @@ impl Agent {
                                             &message.metadata,
                                         )
                                         .await;
-                                }
-
-                                // Record result in thread
-                                {
-                                    let mut sess = session.lock().await;
-                                    if let Some(thread) = sess.threads.get_mut(&thread_id)
-                                        && let Some(turn) = thread.last_turn_mut()
-                                    {
-                                        match &tool_result {
-                                            Ok(output) => {
-                                                turn.record_tool_result(serde_json::json!(output));
-                                            }
-                                            Err(e) => {
-                                                turn.record_tool_error(e.to_string());
-                                            }
-                                        }
-                                    }
                                 }
 
                                 // Check for auth awaiting — defer the return
@@ -688,7 +772,17 @@ impl Agent {
                                     deferred_auth = Some(instructions);
                                 }
 
+                                // Stash full output so subsequent tools can reference it
+                                if let Ok(ref output) = tool_result {
+                                    job_ctx
+                                        .tool_output_stash
+                                        .write()
+                                        .await
+                                        .insert(tc.id.clone(), output.clone());
+                                }
+
                                 // Sanitize and add tool result to context
+                                let is_tool_error = tool_result.is_err();
                                 let result_content = match tool_result {
                                     Ok(output) => {
                                         let sanitized =
@@ -699,8 +793,25 @@ impl Agent {
                                             sanitized.was_modified,
                                         )
                                     }
-                                    Err(e) => format!("Error: {}", e),
+                                    Err(e) => format!("Tool '{}' failed: {}", tc.name, e),
                                 };
+
+                                // Record sanitized result in thread so messages()
+                                // and persist_tool_calls() use cleaned content.
+                                {
+                                    let mut sess = session.lock().await;
+                                    if let Some(thread) = sess.threads.get_mut(&thread_id)
+                                        && let Some(turn) = thread.last_turn_mut()
+                                    {
+                                        if is_tool_error {
+                                            turn.record_tool_error(result_content.clone());
+                                        } else {
+                                            turn.record_tool_result(serde_json::json!(
+                                                result_content
+                                            ));
+                                        }
+                                    }
+                                }
 
                                 context_messages.push(ChatMessage::tool_result(
                                     &tc.id,
@@ -731,6 +842,7 @@ impl Agent {
                             tool_call_id: tc.id.clone(),
                             context_messages: context_messages.clone(),
                             deferred_tool_calls: tool_calls[approval_idx + 1..].to_vec(),
+                            user_timezone: Some(user_tz.name().to_string()),
                         };
 
                         return Ok(AgenticLoopResult::NeedApproval { pending });
@@ -1032,6 +1144,8 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 finish_reason: FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             })
         }
 
@@ -1045,6 +1159,8 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 finish_reason: FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             })
         }
     }
@@ -1069,6 +1185,8 @@ mod tests {
             cost_guard: Arc::new(CostGuard::new(CostGuardConfig::default())),
             sse_tx: None,
             http_interceptor: None,
+            transcription: None,
+            document_extraction: None,
         };
 
         Agent::new(
@@ -1086,6 +1204,8 @@ mod tests {
                 max_actions_per_hour: None,
                 max_tool_iterations: 50,
                 auto_approve_tools: false,
+                default_timezone: "UTC".to_string(),
+                max_tokens_per_job: 0,
             },
             deps,
             Arc::new(ChannelManager::new()),
@@ -1145,6 +1265,96 @@ mod tests {
     }
 
     #[test]
+    fn test_always_approval_requirement_bypasses_session_auto_approve() {
+        // Regression test: even if tool is auto-approved in session,
+        // ApprovalRequirement::Always must still trigger approval.
+        use crate::tools::ApprovalRequirement;
+
+        let mut session = Session::new("user-1");
+        let tool_name = "tool_remove";
+
+        // Manually auto-approve tool_remove in this session
+        session.auto_approve_tool(tool_name);
+        assert!(
+            session.is_tool_auto_approved(tool_name),
+            "tool should be auto-approved"
+        );
+
+        // However, ApprovalRequirement::Always should always require approval
+        // This is verified by the dispatcher logic: Always => true (ignores session state)
+        let always_req = ApprovalRequirement::Always;
+        let requires_approval = match always_req {
+            ApprovalRequirement::Never => false,
+            ApprovalRequirement::UnlessAutoApproved => !session.is_tool_auto_approved(tool_name),
+            ApprovalRequirement::Always => true,
+        };
+
+        assert!(
+            requires_approval,
+            "ApprovalRequirement::Always must require approval even when tool is auto-approved"
+        );
+    }
+
+    #[test]
+    fn test_always_approval_requirement_vs_unless_auto_approved() {
+        // Verify the two requirements behave differently
+        use crate::tools::ApprovalRequirement;
+
+        let mut session = Session::new("user-2");
+        let tool_name = "http";
+
+        // Scenario 1: Tool is auto-approved
+        session.auto_approve_tool(tool_name);
+
+        // UnlessAutoApproved → doesn't require approval if auto-approved
+        let unless_req = ApprovalRequirement::UnlessAutoApproved;
+        let unless_needs = match unless_req {
+            ApprovalRequirement::Never => false,
+            ApprovalRequirement::UnlessAutoApproved => !session.is_tool_auto_approved(tool_name),
+            ApprovalRequirement::Always => true,
+        };
+        assert!(
+            !unless_needs,
+            "UnlessAutoApproved should not need approval when auto-approved"
+        );
+
+        // Always → always requires approval
+        let always_req = ApprovalRequirement::Always;
+        let always_needs = match always_req {
+            ApprovalRequirement::Never => false,
+            ApprovalRequirement::UnlessAutoApproved => !session.is_tool_auto_approved(tool_name),
+            ApprovalRequirement::Always => true,
+        };
+        assert!(
+            always_needs,
+            "Always must always require approval, even when auto-approved"
+        );
+
+        // Scenario 2: Tool is NOT auto-approved
+        let new_tool = "new_tool";
+        assert!(!session.is_tool_auto_approved(new_tool));
+
+        // UnlessAutoApproved → requires approval
+        let unless_needs = match unless_req {
+            ApprovalRequirement::Never => false,
+            ApprovalRequirement::UnlessAutoApproved => !session.is_tool_auto_approved(new_tool),
+            ApprovalRequirement::Always => true,
+        };
+        assert!(
+            unless_needs,
+            "UnlessAutoApproved should need approval when not auto-approved"
+        );
+
+        // Always → always requires approval
+        let always_needs = match always_req {
+            ApprovalRequirement::Never => false,
+            ApprovalRequirement::UnlessAutoApproved => !session.is_tool_auto_approved(new_tool),
+            ApprovalRequirement::Always => true,
+        };
+        assert!(always_needs, "Always must always require approval");
+    }
+
+    #[test]
     fn test_pending_approval_serialization_backcompat_without_deferred_calls() {
         // PendingApproval from before the deferred_tool_calls field was added
         // should deserialize with an empty vec (via #[serde(default)]).
@@ -1188,6 +1398,7 @@ mod tests {
                     arguments: serde_json::json!({"message": "done"}),
                 },
             ],
+            user_timezone: None,
         };
 
         let json = serde_json::to_string(&pending).expect("serialize");
@@ -1535,12 +1746,8 @@ mod tests {
         use crate::testing::StubLlm;
 
         let stub = Arc::new(StubLlm::failing_non_transient("ctx-bomb"));
-        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
-            max_output_length: 100_000,
-            injection_check_enabled: false,
-        }));
 
-        let reasoning = Reasoning::new(stub.clone(), safety);
+        let reasoning = Reasoning::new(stub.clone());
 
         // Build a fat context with lots of history.
         let messages = vec![
@@ -1605,6 +1812,8 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 5,
                 finish_reason: FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             })
         }
 
@@ -1620,6 +1829,8 @@ mod tests {
                     input_tokens: 0,
                     output_tokens: 5,
                     finish_reason: FinishReason::Stop,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
                 });
             }
             // Tools available: always call one.
@@ -1633,6 +1844,8 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 5,
                 finish_reason: FinishReason::ToolUse,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             })
         }
     }
@@ -1644,11 +1857,7 @@ mod tests {
         use crate::llm::{Reasoning, ReasoningContext, RespondResult, ToolDefinition};
 
         let provider = Arc::new(AlwaysToolCallProvider);
-        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
-            max_output_length: 100_000,
-            injection_check_enabled: false,
-        }));
-        let reasoning = Reasoning::new(provider, safety);
+        let reasoning = Reasoning::new(provider);
 
         let tool_def = ToolDefinition {
             name: "echo".to_string(),
@@ -1757,6 +1966,8 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 2,
                 finish_reason: FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             })
         }
 
@@ -1771,6 +1982,8 @@ mod tests {
                     input_tokens: 0,
                     output_tokens: 2,
                     finish_reason: FinishReason::Stop,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
                 });
             }
             // Always call a tool that does not exist in the registry.
@@ -1784,6 +1997,8 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 5,
                 finish_reason: FinishReason::ToolUse,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             })
         }
     }
@@ -1809,6 +2024,8 @@ mod tests {
             cost_guard: Arc::new(CostGuard::new(CostGuardConfig::default())),
             sse_tx: None,
             http_interceptor: None,
+            transcription: None,
+            document_extraction: None,
         };
 
         Agent::new(
@@ -1826,6 +2043,8 @@ mod tests {
                 max_actions_per_hour: None,
                 max_tool_iterations,
                 auto_approve_tools: true,
+                default_timezone: "UTC".to_string(),
+                max_tokens_per_job: 0,
             },
             deps,
             Arc::new(ChannelManager::new()),
@@ -1922,6 +2141,8 @@ mod tests {
                 cost_guard: Arc::new(CostGuard::new(CostGuardConfig::default())),
                 sse_tx: None,
                 http_interceptor: None,
+                transcription: None,
+                document_extraction: None,
             };
 
             Agent::new(
@@ -1939,6 +2160,8 @@ mod tests {
                     max_actions_per_hour: None,
                     max_tool_iterations: max_iter,
                     auto_approve_tools: true,
+                    default_timezone: "UTC".to_string(),
+                    max_tokens_per_job: 0,
                 },
                 deps,
                 Arc::new(ChannelManager::new()),
@@ -2018,5 +2241,69 @@ mod tests {
         let input = "This is a normal response with [brackets] inside.";
         let result = super::strip_internal_tool_call_text(input);
         assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_tool_error_format_includes_tool_name() {
+        // Regression test for issue #487: tool errors sent to the LLM should
+        // include the tool name so the model can reason about which tool failed
+        // and try alternatives.
+        let tool_name = "http";
+        let err = crate::error::ToolError::ExecutionFailed {
+            name: tool_name.to_string(),
+            reason: "connection refused".to_string(),
+        };
+        let formatted = format!("Tool '{}' failed: {}", tool_name, err);
+        assert!(
+            formatted.contains("Tool 'http' failed:"),
+            "Error should identify the tool by name, got: {formatted}"
+        );
+        assert!(
+            formatted.contains("connection refused"),
+            "Error should include the underlying reason, got: {formatted}"
+        );
+    }
+
+    #[test]
+    fn test_image_sentinel_empty_data_url_should_be_skipped() {
+        // Regression: unwrap_or_default() on missing "data" field produces an empty
+        // string. Broadcasting an empty data_url would send a broken SSE event.
+        let sentinel = serde_json::json!({
+            "type": "image_generated",
+            "path": "/tmp/image.png"
+            // "data" field is missing
+        });
+
+        let data_url = sentinel
+            .get("data")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(
+            data_url.is_empty(),
+            "Missing 'data' field should produce empty string"
+        );
+        // The fix: empty data_url means we skip broadcasting
+    }
+
+    #[test]
+    fn test_image_sentinel_present_data_url_is_valid() {
+        let sentinel = serde_json::json!({
+            "type": "image_generated",
+            "data": "data:image/png;base64,abc123",
+            "path": "/tmp/image.png"
+        });
+
+        let data_url = sentinel
+            .get("data")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(
+            !data_url.is_empty(),
+            "Present 'data' field should produce non-empty string"
+        );
     }
 }

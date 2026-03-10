@@ -2,30 +2,36 @@
   "name": "discord",
   "display_name": "Discord Channel",
   "kind": "channel",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "wit_version": "0.3.0",
   "description": "Talk to your agent in Discord",
-  "keywords": ["messaging", "chat", "discord", "bot"],
-
+  "keywords": [
+    "messaging",
+    "chat",
+    "discord",
+    "bot"
+  ],
   "source": {
     "dir": "channels-src/discord",
     "capabilities": "discord.capabilities.json",
     "crate_name": "discord-channel"
   },
-
   "artifacts": {
     "wasm32-wasip2": {
       "url": "https://github.com/nearai/ironclaw/releases/latest/download/discord-wasm32-wasip2.tar.gz",
-      "sha256": null
+      "sha256": "85b424604482da3fb9badb56a0360ff4c93670bc7be0ad7f57ef9d85ff972b6f"
     }
   },
-
   "auth_summary": {
     "method": "manual",
     "provider": "Discord",
-    "secrets": ["discord_bot_token"],
+    "secrets": [
+      "discord_bot_token"
+    ],
     "shared_auth": null,
     "setup_url": "https://discord.com/developers/applications"
   },
-
-  "tags": ["messaging"]
+  "tags": [
+    "messaging"
+  ]
 }

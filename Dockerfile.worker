@@ -62,6 +62,9 @@ RUN useradd -m -u 1000 -s /bin/bash sandbox \
     && mkdir -p /home/sandbox/.claude \
     && chown sandbox:sandbox /home/sandbox/.claude
 
+# Pre-install MCP config for Odoo MCP access in Claude Code mode
+COPY --chown=sandbox:sandbox mcp-config.json /home/sandbox/.mcp.json
+
 USER sandbox
 WORKDIR /workspace
 

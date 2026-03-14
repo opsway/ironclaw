@@ -365,7 +365,7 @@ impl ContainerJobManager {
             binds: if binds.is_empty() { None } else { Some(binds) },
             memory: Some((memory_mb * 1024 * 1024) as i64),
             cpu_shares: Some(self.config.cpu_shares as i64),
-            network_mode: Some("bridge".to_string()),
+            network_mode: Some("ironclaw-gateway-infra_internal".to_string()),
             extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
             cap_drop: Some(vec!["ALL".to_string()]),
             cap_add: Some(vec!["CHOWN".to_string()]),

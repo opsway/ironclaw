@@ -2,7 +2,7 @@
   "mcpServers": {
     "odoo": {
       "type": "http",
-      "url": "http://host.docker.internal:9000"
+      "url": "http://odoo-mcp:9000"
     }
   }
 }

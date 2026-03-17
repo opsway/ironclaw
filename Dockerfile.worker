@@ -62,8 +62,18 @@ RUN useradd -m -u 1000 -s /bin/bash sandbox \
     && mkdir -p /home/sandbox/.claude \
     && chown sandbox:sandbox /home/sandbox/.claude
 
+# Pre-install MCP config for Odoo MCP access in Claude Code mode
+COPY --chown=sandbox:sandbox mcp-config.json /home/sandbox/.mcp.json
+
+# Create entrypoint script that copies MCP config to /workspace at startup
+# Claude Code looks for .mcp.json in the project root (/workspace)
+RUN echo '#!/bin/bash' > /home/sandbox/entrypoint.sh && \
+    echo 'cp /home/sandbox/.mcp.json /workspace/.mcp.json 2>/dev/null || true' >> /home/sandbox/entrypoint.sh && \
+    echo 'exec ironclaw "$@"' >> /home/sandbox/entrypoint.sh && \
+    chmod +x /home/sandbox/entrypoint.sh
+
 USER sandbox
 WORKDIR /workspace
 
 # The orchestrator passes the full command via Docker cmd.
-ENTRYPOINT ["ironclaw"]
+ENTRYPOINT ["/home/sandbox/entrypoint.sh"]
